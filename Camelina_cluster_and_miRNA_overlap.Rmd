@@ -1,0 +1,639 @@
+---
+title: "MiRNA_gene_level_overlap_results"
+author: "Asa Budnick"
+date: "2024-03-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+#Analysis Plan 
+##import ciri2 and clear original data, cluster, merge and export a new finalized sheet
+##Import List of genes which were identified to contain an miRNA target by poudel et al. and also contain a circRNA
+##Pull circRNA coordinates for those genes
+##Pull genome sequence between those coordinates 
+##Run through psRNATargetv2 
+
+```{r import ciri2 and clear original data}
+library(dplyr)
+CIRI2<-read.csv(file = "CIRI2_original_output.csv",header = T)
+CLEAR<-read.csv(file = "CLEAR_original_output.csv", header= T)
+
+#Add Method Column
+CIRI2$Method<-"CIRI2"
+CLEAR$Method<-"CLEAR"
+
+
+```
+
+```{r Fix columns and merge}
+colnames(CIRI2)
+colnames(CLEAR)
+
+#Remove extraneous columns from CIRI2 (X, filename)
+CIRI2_clean<- CIRI2 %>%  
+  select(!X) %>% 
+  select(!filename)
+
+#Remove extraneous columns from CLEAR (X, filename, thickstart, thickend, itemRgb (always 0,0,0))
+CLEAR_clean<- CLEAR %>% 
+  select(!X) %>% 
+  select(!filename) %>% 
+  select(!thickStart) %>% 
+  select(!thickEnd) %>% 
+  select(!itemRgb)
+
+
+#Harmonize common columns 
+colnames(CIRI2_clean)
+
+# strand, merge.cs_gene.id, merge.At_gene.id, merge.gene.description, merge.lncRNA.id, and Method should all already be identical in name and content 
+
+#CIRI2 circRNA_ID needs to be fixed
+CIRI2_clean$circRNA_ID<-gsub(CIRI2_clean$circRNA_ID, pattern="\\|", replacement = "-")
+# CLEAR needs to have a circRNA_ID created which matches the proper format
+CLEAR_clean$circRNA_ID <- paste(CLEAR_clean$chrom,":", CLEAR_clean$start, "-", CLEAR_clean$end,sep = "")
+
+# CLEAR: chrom, start, end, circType, geneName need to be renamed to match ciri2
+colnames(CLEAR_clean)
+oldnames<-list("chrom", "start", "end", "circType", "geneName") 
+newnames<-list("chr","circRNA_start","circRNA_end","circRNA_type","gene_id")
+names(newnames)<-oldnames
+CLEAR_clean<-plyr::rename(CLEAR_clean,replace = newnames)
+
+
+##Fix inconsistencies with sample, day, trt, day.trt, 
+#CIRI2: sample needs to be corrected to Sample and rep needs to be filled in with data from CLEAR
+colnames(CIRI2_clean)[1]<-"Sample"
+
+Sample_rep_map<-CLEAR_clean %>% 
+  group_by(Sample) %>%  
+  select(rep) %>%  
+  unique()
+CIRI2_clean$rep<-NaN
+CIRI2_clean<-rows_patch(x = CIRI2_clean,y=Sample_rep_map,by = "Sample")
+
+#CLEAR: need to fix CLEAR day and treatment to match ciri2 
+colnames(CLEAR_clean)[2]<-"day.trt"
+CLEAR_clean$day<-as.numeric(substr(CLEAR_clean$day.trt,1,1))
+CLEAR_clean$trt<-substr(CLEAR_clean$day.trt,2,2)
+
+
+#Now we can specify that the colnames which are not in common are distinct to their info source
+#append CLEAR_ to all clear distinct data columns
+colnames(CLEAR_clean)[!(colnames(CLEAR_clean) %in% colnames(CIRI2_clean))]<- paste("CLEAR_",colnames(CLEAR_clean)[!(colnames(CLEAR_clean) %in% colnames(CIRI2_clean))]
+, sep = "")
+
+#append CIRI2_ to all ciri2 unique data columns
+colnames(CIRI2_clean)[!(colnames(CIRI2_clean) %in% colnames(CLEAR_clean))]<- paste("CIRI2_",colnames(CIRI2_clean)[!(colnames(CIRI2_clean) %in% colnames(CLEAR_clean))]
+, sep = "")
+
+
+#now let's bind rows to merge both 
+Merged_DF<-bind_rows(CIRI2_clean, CLEAR_clean)
+#count and remove those circRNAs from scaffold chromosomes 
+length(grep(Merged_DF$chr, pattern="Scaffold"))
+
+Merged_DF<-Merged_DF[-grep(Merged_DF$chr, pattern="Scaffold"),]
+#62 circrnas from scaffold contigs removed
+```
+
+```{r Cluster}
+#Pull circRNA_ID, chr, start, and stop
+
+Clust_form<-Merged_DF %>% 
+  select(circRNA_ID, chr, circRNA_start, circRNA_end) %>% 
+  unique()
+
+#Pull circRNA_ID, chr, start, and stop
+colnames(Clust_form)<-c("circRNA_ID","chrom","start","end")
+rownames(Clust_form)<-make.names(Clust_form$circRNA_ID) # need to make.names in order to allow the unusual characters in circRNA IDs
+
+Clust_Format<-Clust_form[,-1]
+
+
+forloop_cluster_dataframe<-data.frame()
+for( chr in unique(Clust_Format$chrom)){
+  chromset<-Clust_Format[Clust_Format$chrom==chr,2:3]
+  
+  testdist<-dist(chromset,  method = "manhattan")
+  heirarch_clust <- hclust(testdist, method="complete",)
+  trimmed_clust <- cutree(heirarch_clust, h=10)
+  names_list<-split(names(trimmed_clust), trimmed_clust) 
+  
+  forloop_cluster_dataframe<-dplyr::bind_rows(forloop_cluster_dataframe,plyr::ldply(names_list,rbind))
+}
+
+library(purrr)
+
+#format names back to original circIDs 
+#cluster_renamed<-as.data.frame(lapply(forloop_cluster_dataframe, FUN = function(entry) sub(pattern="(^Chr\\d*)\\.(\\d*)\\.(\\d*)$", replacement="\\1:\\2-\\3",x=entry)))
+
+Names_back<-function(x){
+  sub(pattern="(^Chr\\d*)\\.(\\d*)\\.(\\d*)$", replacement="\\1:\\2-\\3",x=x, perl = F)}
+
+cluster_renamed<-map_df(forloop_cluster_dataframe,.f=Names_back) 
+colnames(cluster_renamed)<-c(".id","X1","X2","X3")
+  
+cluster_renamed$New_circ_ID<-with(cluster_renamed, paste0(X1,",",X2,",",X3))
+cluster_renamed$New_circ_ID<-gsub(pattern = ",NA",replacement = "",x=cluster_renamed$New_circ_ID)
+```
+
+```{r label circRNAs in the full filtered dataset with the names of the clusters}
+library(tidyr)
+cluster_renamed2<- cluster_renamed[,-1] %>% 
+ pivot_longer(cols = !New_circ_ID, names_to = "Original_ID")
+cluster_renamed2<-cluster_renamed2[complete.cases(cluster_renamed2),c(1,3)]
+colnames(cluster_renamed2)<-c("CircRNA_Cluster_ID","circRNA_ID")
+
+Merged_clustered<-merge(cluster_renamed2, Merged_DF, by="circRNA_ID")
+
+#number of unique clusters
+n_distinct(Merged_clustered$circRNA_ID)-n_distinct(Merged_clustered$CircRNA_Cluster_ID)
+
+#132 circRNAs collapsed in clustering
+```
+
+```{r do some exports}
+library(openxlsx)
+Merged_clustered
+#add in circ_CSAgeneID_circN# as an alias identifier for circRNAs 
+Merged_clustered_Alias<-Merged_clustered %>% 
+  select(CircRNA_Cluster_ID,gene_id,circRNA_start) %>% 
+  arrange(circRNA_start) %>% 
+  select(CircRNA_Cluster_ID,gene_id) %>% 
+  unique() %>% 
+  group_by(gene_id) %>% 
+  dplyr::mutate(circgene_number = row_number()) %>% 
+  filter(!is.na(gene_id)) %>% 
+  ungroup() %>% 
+  mutate(circRNA_alias = paste0("circ",gene_id,"_",circgene_number)) %>% 
+  select(CircRNA_Cluster_ID,circRNA_alias)
+
+Merged_clustered2<-merge(Merged_clustered_Alias,Merged_clustered,by="CircRNA_Cluster_ID",all.y=T)
+README_Export1<- "Data comes from CIRI2 and CLEAR output files which had had some metadata attached. Data was cleaned to make column names and structures compatible, distinct columns were named distinctly and identical columns were bound. CircRNAs were clustered based on a 10bp manhattan distance. CircRNAs identified originating from Scaffold contigs were removed (62 of them). The merged clustered dataframe contains 7536 observartions of 3754 unique circRNAs. circRNA_alias is an alternative circRNA id that incorporates the geneID and the ordinal number of that circRNA within the gene (ordered by circRNA start coordinate)."
+Export_1_list <- list("README" = README_Export1, "Clustered_CIRI2_and_CLEAR" = Merged_clustered2)
+
+openxlsx::write.xlsx(x=Export_1_list,file="240523_Clustered_and_Merged_CIRI2_and_CLEAR.xlsx")
+
+```
+
+
+```{r import gene list from poudel et al}
+genelist<-read.csv(file = "OverlappingGeneIDs.csv",header = T)
+#some suspicion that this gene list may be incorrect (potential copy pasting errors in venn diagram), create directly from source data - poudel Supplementary Table 4 
+
+Poudel_S4<-read.csv(file = "Poudel_s4_miRNA_gene_targets.csv",skip = 1,header = T)
+#Take only the gene IDs, split them and format them into a single dataframe 
+PGenes<-toString(Poudel_S4[,2])
+PGenes<-unlist(strsplit(PGenes,","))
+PGenes<-unique(PGenes)
+PGenes<-gsub(x=PGenes, pattern = "\\.\\d*$", replacement = "" )
+Overlapping_genes<- PGenes[ PGenes %in% unique(Merged_clustered$gene_id)]
+#test to see if one of the missing genes is now present: 
+"Csa11g001390" %in% Overlapping_genes
+
+#it is now present
+```
+
+```{r import camelina circRNAs and identify coordinates for circRNAs from these genes}
+Merged_Simple<-Merged_clustered %>% 
+  select(CircRNA_Cluster_ID,chr,circRNA_start,circRNA_end,strand,gene_id) %>% 
+  unique()
+#pull circRNAs from the overlapping gene list and then pull their coordinates
+Overlapping_poudel<- Merged_Simple %>% 
+  filter(gene_id %in% Overlapping_genes) %>% 
+  unique()
+#changes from 73circRNAs to 100circRNAs
+library(GenomicRanges)
+
+CircRanges<-makeGRangesFromDataFrame(df = Overlapping_poudel, keep.extra.columns = T, seqnames.field ="chr",start.field = "circRNA_start",end.field = "circRNA_end", strand.field = "strand")
+
+```
+
+```{r pull fasta file for genome of granges object}
+library(Biostrings)
+library(BSgenome)
+#install.packages("remotes")
+#remotes::install_github("snystrom/dremeR")
+library(memes)
+CamSat_genome<-readDNAStringSet(filepath = "Cs_genome_v2.fa")
+showMethods(Biostrings::getSeq)
+#can do it with bsgenomes if they have the camelina 
+CircRNA_Genomic_sequences<-get_sequence(CircRanges, CamSat_genome)
+
+
+write_fasta(seq = CircRNA_Genomic_sequences, path="Poudel_Overlap_CircRNA_Genomic_Sequences_3.fa")
+```
+
+#Predicted miRNA target using psRNAtarget2 with default parameters. 
+
+```{r import psRNAtargetv2 results}
+MiRNAs_targeting_genomic_regions<-read.csv(file = "psRNATargetV2_miRNA_target_circRNA_Genome_240305.txt",header = T,sep="\t",skip = 1)
+
+
+#Target acc was replaced with the genomic range - need to expand this to chr:start-stop and then rejoin with circRNA_cluster_id and collapse on that basis
+miRNA_reformat<-separate(MiRNAs_targeting_genomic_regions,col = "Target_Acc.",sep = ":",into =c("chr","start-end"))
+miRNA_reformat<-separate(miRNA_reformat,col = "start-end",sep = "-",into =c("circRNA_start","circRNA_end"))
+
+miRNA_merged<-merge(Merged_Simple,miRNA_reformat,by=c("chr","circRNA_start","circRNA_end"))
+#Now delete duplicated / unwanted information
+miRNA_merged_clean<- miRNA_merged %>% 
+  select(gene_id, miRNA_Acc.,CircRNA_Cluster_ID, miRNA_start,miRNA_end,Target_start, Target_end,miRNA_aligned_fragment,Inhibition,Multiplicity) %>% 
+  unique()
+
+#add in gene description as well as arabidopsis orthology
+append_gene_info<-Merged_clustered %>% 
+  select(gene_id,merge.At_gene.id,merge.gene.description) %>% 
+  filter(gene_id %in% Overlapping_genes) %>% 
+  unique() 
+append_gene_info$merge.gene.description<-gsub(pattern = "^\\| ",replacement = "", x=append_gene_info$merge.gene.description)
+
+colnames(append_gene_info)<-c("gene_id","Ath_gene_id","Gene_description")
+#merge it in
+miRNA_merged_geneInfo<-merge(x = miRNA_merged_clean,y=append_gene_info,by="gene_id")
+miRNA_merged_geneInfo<-miRNA_merged_geneInfo[,c(1,12,3,2,4:11)]
+#export it
+
+README_Export2<-"Combined table of miRNAs and circRNAs for the subset of genes found to have targeting miRNAs by poudel et al (supplementary table 4) which also contained circRNAs in our data. Genomic sequence between CircRNA backsplice junction coordinates was extracted and used to predict miRNA target sites. PsRNAtargetV2 was used to predict miRNA target sites using the default settings. Produced on 240305"
+Export_2_list <- list("README" = README_Export2, "CircRNA-Genomic_miRNA_targets" = miRNA_merged_geneInfo)
+
+openxlsx::write.xlsx(x=Export_2_list,file="240305_CircRNA_Genomic_Range_miRNA_targets.xlsx")
+
+```
+
+
+```{r pull unique gene descriptions and miRNAs to analyze by hand}
+miRNA_circ_genes<-unique(miRNA_merged_geneInfo$Gene_description)
+miRNA_circ_miRNAs<-unique(miRNA_merged_geneInfo$miRNA_Acc.)
+
+#after looking into things there are a few categories that may be worth examining in more detail - one is potentially cellular transport (P-loop proteins, myosin, clip, and iltyhia )
+#pull those and see if there are similar miRNAs targeting them 
+
+miRNA_circ_cell_transport<- miRNA_merged_geneInfo %>%  
+  filter(grepl(pattern="P-loop",x=Gene_description) | grepl(pattern="myosin",x=Gene_description) | grepl(pattern="CLIP-associated",x=Gene_description) |  grepl(pattern="ILITYHIA",x=Gene_description) )
+
+#promising overlap in the miRNAs here. . . now I can look at these and see if they have anything else to support them in the literature or mirbase
+miRNA_circ_cell_transport_miRNAs<- miRNA_circ_cell_transport %>% 
+  group_by(miRNA_Acc.) %>% 
+  dplyr::summarise(plyr::count(miRNA_Acc.))
+#library(clipr)
+#write_clip(content = miRNA_circ_cell_transport)
+```
+
+```{r pull in psRNAtargetV2 CDS results}
+#these results were generated by using psRNAtargetV2 with the mirbase mature miRNAs from camelina and the CDS sequences available for the reference genome from DH55. 
+
+CDS1<-read.csv(file = "psRNATargetJob_Cs_cds_1sthalf.txt",header = T,sep="\t",skip = 1)
+CDS2<-read.csv(file = "psRNATargetJob_Cs_cds_2ndhalf.txt",header = T,sep="\t",skip = 1)
+
+CDS_miRNAs<-rbind.data.frame(CDS1,CDS2)
+#reformat cds names
+CDS_miRNAs$Target_Acc.<-gsub(x=CDS_miRNAs$Target_Acc., pattern = "\\.\\d*$", replacement = "" )
+#now ready to format for the network
+
+```
+
+```{r create a network model for cytoskeletal implicated nodes}
+#create circRNA nodes, miRNA nodes, and edges, from our data
+CT_circ_nodes<- miRNA_circ_cell_transport %>% 
+  select(CircRNA_Cluster_ID) %>% 
+  dplyr::mutate(Node_type<-"circRNA") %>% 
+  unique()
+CT_miRNA_Nodes<- miRNA_circ_cell_transport %>% 
+  select(miRNA_Acc.) %>% 
+  dplyr::mutate(Node_type<-"miRNA") %>% 
+  unique()
+
+CT_edges<-miRNA_circ_cell_transport %>% 
+  select(miRNA_Acc., CircRNA_Cluster_ID)
+
+#add in poudel gene connections
+#need to reformat their table first
+#Deprecated because of lack of consensus between poudel and mirbase miRNAs (there are differences in both name and sequence which means they cannot be harmonized without making assumptions )
+
+#Poudel_Reformat<-Poudel_S4 %>% mutate(Camelina_target= strsplit(Camelina_target, ",")) %>%
+#        unnest(Camelina_target) %>%
+ #       group_by(miRNA) %>%
+  #      mutate(row = row_number()) %>%
+   #     spread(row, Camelina_target)
+#Poudel_Reformated<-Poudel_Reformat %>% 
+ # select(!Function & !Arabidopsis_homolog & !X & !X.1 & !X.2) %>% 
+#  pivot_longer(cols=as.character(c(1:50)),names_to = "Trash",values_drop_na	
+#=T) %>% 
+ # select(!Trash)
+
+
+#mirBase<-c("cas-miR11592","cas-miR157d","cas-miR400","cas-miR396a","cas-miR396b","cas-miR397","cas-miR158a")
+#poudel_map<-c("Csa-miRf10010-5p","Csa-miR157d-5p","Csa-miR400-5p","Csa-miR396a-5p","Csa-miR396b-5p","Csa-miR397a-5p","Csa-miR158a-5p")
+#Poudel_Reformated$miRNA<-plyr::mapvalues(x = Poudel_Reformated$miRNA,from = poudel_map,to=mirBase)
+
+#Poudel_Reformated$miRNA<-gsub(x=Poudel_Reformated$miRNA,pattern = "Csa", replacement = "cas")
+
+
+#Poudel_Reformated$value<-gsub(x=Poudel_Reformated$value, pattern = "\\.\\d*$", replacement = "" )
+#colnames(Poudel_Reformated)<-c("miRNA","Gene_ID")
+#Poudel_Gene_Nodes<-cbind.data.frame(unique(Poudel_Reformated$Gene_ID),"Gene")
+#colnames(Poudel_Gene_Nodes)<-c("Node_ID","Node_Type")
+#Poudel_miRNA_Nodes<-cbind.data.frame(unique(Poudel_Reformated$miRNA),"miRNA")
+#colnames(Poudel_miRNA_Nodes)<-c("Node_ID","Node_Type")
+
+
+##Actually need to rename poudel miRNAs with mirBase nomenclature
+
+#read in mirbase mature RNAs
+#mirbase_miRNAs<-read.csv("mirbase_miRNA_name_seq.csv",header = T)
+#poudel_miRNAs<-read.csv("poudel_miRNA_name_seq_reformat.csv",header = T)
+
+
+#test to look at sequence overlap 
+#sum(mirbase_miRNAs$Sequence %in% poudel_miRNAs$Sequence)
+#86 out of 112 miRNAs have an exact match sequence . . . not the most inspiring 
+#there are some miRNAs from mirbase that don't exist in poudel ex: cas-miR158b
+# there are also ofc many poudel miRNAs that do not exist in mirbase based on the difference in counts alone 
+#The above had too many discrepancies to reconcile the whole set, there are also unreconciliable discrepancies between mirBase and poudel miRNA names
+
+#create CDS nodes and edges
+CDS_Nodes<-cbind.data.frame(CDS_miRNAs$Target_Acc., "Gene")
+colnames(CDS_Nodes)<-c("Node_ID","Node_Type")
+CDS_miRNA_Nodes<-cbind.data.frame(CDS_miRNAs$miRNA_Acc., "miRNA")
+colnames(CDS_miRNA_Nodes)<-c("Node_ID","Node_Type")
+
+CDS_Edges<-unique(cbind.data.frame(CDS_miRNAs$miRNA_Acc.,CDS_miRNAs$Target_Acc.))
+
+#Okay should have all the nodes and edges now, just need to format and combine
+colnames(CT_circ_nodes)<-c("Node_ID","Node_Type")
+colnames(CT_miRNA_Nodes)<-c("Node_ID","Node_Type")
+
+CT_nodes<-unique(bind_rows(CT_circ_nodes,CT_miRNA_Nodes,CDS_miRNA_Nodes,CDS_Nodes))
+#Add in a target to edges to use for filtering later
+colnames(CDS_Edges)<-c("From","To")
+CDS_Edges$Target<-"Gene"
+colnames(CT_edges)<-c("From","To")
+CT_edges$Target<-"circRNA"
+
+
+CT_edges_final<-unique(bind_rows(CDS_Edges,CT_edges))
+
+#put the network together
+library(igraph)
+CT_Net_1<-graph_from_data_frame(CT_edges_final,directed = F, vertices = CT_nodes)
+
+
+
+```
+
+```{r work on visualization}
+
+library(tidygraph)
+library(ggraph)
+library(ggiraph)
+CT_Net_1_TG<-as_tbl_graph(CT_Net_1)
+
+#network is currently too big to run 
+#Ggraph1<-CT_Net_1_TG %>% 
+#  ggraph(layout = 'kk')+
+#  geom_edge_fan(width = .2, color = 'lightblue') + 
+#  geom_node_point(aes(shape = Node_Type)) + 
+ # coord_fixed() + 
+ # theme_graph()
+#Ggraph1
+
+
+#try to limit it to circRNAs +1 or 2 nodes
+
+
+circRNASubg <- CT_Net_1_TG %>%
+      convert(to_local_neighborhood,  
+          node = which(.N()$name == "Chr7:11660405-11667968"
+), 
+          mode = "all", order= 1)
+#try to create a subgraph which has only circRNA and miRNA
+circRNAsubg2 <- CT_Net_1_TG %>% 
+  convert(to_subgraph, subset_by="nodes", Node_Type %in% c("circRNA","miRNA")) %>% 
+  convert(to_subgraph, subset_by="edges", Target == "circRNA")
+  
+
+Ggraph1<-circRNAsubg2 %>% 
+  ggraph(layout = 'kk')+
+  geom_edge_fan(width = .2, color = 'lightblue') + 
+  geom_node_point(aes(shape = Node_Type)) + 
+  coord_fixed() + 
+  theme_graph()
+Ggraph1
+  
+Ggraph4<-circRNASubg %>% 
+  as.igraph() %>% 
+  ggraph(layout = 'fr')+
+  geom_point_interactive(size = 3,
+    mapping = aes(x = x, y = y, data_id=Node_Type,
+                  tooltip = paste0(name)),alpha=0)+
+  geom_edge_arc(width = .6, color = 'grey',alpha=.3) + 
+  geom_node_point(aes(filter=Node_Type=="circRNA", shape=Node_Type, color=Node_Type,size=5))+
+  geom_node_point(aes(filter=Node_Type=="miRNA", shape =Node_Type, color=Node_Type,size=5)) + 
+  geom_node_point(aes(filter=Node_Type=="Gene", shape=Node_Type, color=Node_Type,size=3))+
+  coord_fixed() + 
+  theme_graph()
+girafe(ggobj = Ggraph4, width_svg = 8, height_svg = 8,
+       options = list(opts_sizing(rescale = FALSE), opts_zoom(min = 1, max =3)))
+```
+
+```{r look at what the network looks like without the poudel gene information}
+
+CT_Net2_nodes<-bind_rows(CT_circ_nodes,CT_miRNA_Nodes)
+CT_Net_2<-graph_from_data_frame(CT_edges,directed = F, vertices = CT_Net2_nodes)
+
+
+CT_Net_2_TG<-as_tbl_graph(CT_Net_2)
+
+Ggraph2<-CT_Net_2_TG %>% 
+  ggraph(layout = "kk")+
+  geom_edge_fan(width = .3, color = 'grey') + 
+  geom_node_point(aes(shape = Node_Type)) + 
+  coord_fixed() + 
+  theme_graph()
+Ggraph2
+
+Ggraph5<-CT_Net_2_TG %>% 
+  as.igraph() %>% 
+  ggraph(layout = 'kk')+
+  geom_point_interactive(size = 3,
+    mapping = aes(x = x, y = y, data_id=Node_Type,
+                  tooltip = paste0(name)),alpha=0)+
+  geom_edge_fan(width = .6, color = 'black') + 
+  geom_node_point(aes(filter=Node_Type=="circRNA", shape=Node_Type, color="lightblue"))+
+  geom_node_point(aes(filter=Node_Type=="miRNA", shape = Node_Type, color="lightgreen")) + 
+  geom_node_point(aes(filter=Node_Type=="Gene", shape=Node_Type, color="orange"))+
+  coord_fixed() + 
+  theme_graph()
+
+girafe(ggobj = Ggraph5, width_svg = 8, height_svg = 8,
+       options = list(opts_sizing(rescale = FALSE), opts_zoom(min = 1, max =3)))
+
+```
+```{r try to show the circRNA and miRNA and then add the genes as a number}
+CT_numGenes_subg<-CT_Net_1_TG %>% 
+  activate(nodes) %>% 
+  mutate(
+    gene_targets = centrality_degree(
+      weights = as.numeric(.E()$Target == 'Gene'),
+      mode = 'in')) %>% 
+  filter(.N()$name %in% CT_Net2_nodes$Node_ID)
+#for publication
+  #fix legend
+  #add labels to miRNAs and create and add names to circRNAs 
+Ggraph5<-CT_numGenes_subg %>% 
+  as.igraph() %>% 
+  ggraph(layout = 'fr')+
+  geom_point_interactive(size = 3,
+    mapping = aes(x = x, y = y, data_id=Node_Type,
+                  tooltip = paste0(name)),alpha=0)+
+  geom_edge_arc(width = .6, color = 'black',alpha=.3) + 
+  geom_node_point(aes(filter=Node_Type=="circRNA", shape=Node_Type, color=Node_Type,size=5))+
+  geom_node_point(aes(filter=Node_Type=="miRNA", shape =Node_Type, color=Node_Type,size=5))+
+  geom_node_text(aes(filter=Node_Type=="miRNA", label = gene_targets),nudge_y=-0.2) +
+  coord_fixed() + 
+  theme_graph()
+girafe(ggobj = Ggraph5, width_svg = 8, height_svg = 8,
+       options = list(opts_sizing(rescale = FALSE), opts_zoom(min = 1, max =3)))
+  
+
+```
+```{r refine figure for publication}
+#change CT_net to add nicknames for circRNAs and miRNAs. Probably easiest to do from the original data rather than on the network object. 
+
+#add nickname for circ_nodes
+
+
+circMap<-c("Chr7:11660405-11667968", "Chr19:20892522-20893510", "Chr18:4919382-4922698", "Chr11:33787372-33788417", "Chr9:24182979-24183578", "Chr4:11239833-11241583", "Chr14:26561593-26562313", "Chr15:4169730-4170590", "Chr16:28542224-28543162", "Chr7:8031160-8034796","Chr19:20892858-20894208")
+
+
+nicknames<-c("ILA_circ1", "CLIP_circ1", "MYA2_circ1", "MYA2_circ2", "PLNTPH_1_circ1", "PLNTPH_1_circ2", "PLNTPH_2_circ1", "PLNTPH_3_circ1", "PLNTPH_4_circ1", "PLNTPH_5_circ1","CLIP_circ2")
+
+alias_selection<-Merged_clustered2[Merged_clustered2$CircRNA_Cluster_ID %in% circMap,]
+alias_selection<- alias_selection %>% 
+  select(CircRNA_Cluster_ID,circRNA_ID,circRNA_alias) %>% 
+  unique()
+
+Alias_names<-c(
+"circCsa07g023170_1", "circCsa19g048650_1", "circCsa18g009960_1","circCsa11g070910_1","circCsa09g062890_1","circCsa04g023790_1", "circCsa14g057490_1", "circCsa15g012790_1", "circCsa16g056350_1","circCsa07g016320_1", "circCsa19g048650_2")
+
+
+
+CT_circ_nodes$Nicknames<-plyr::mapvalues(CT_circ_nodes$Node_ID,from=circMap, to=Alias_names)
+#rename all miRNA nodes
+refined_miRNA_nodes<-unique(rbind.data.frame(CT_miRNA_Nodes,CDS_miRNA_Nodes))
+refined_miRNA_nodes$Node_ID<-sub(x=refined_miRNA_nodes$Node_ID, pattern = "^cas-(miR\\d*).*", replacement = "\\1")
+refined_miRNA_nodes<-unique(refined_miRNA_nodes)
+#rename all miRNA edges
+CT_edges_final$From<-sub(x=CT_edges_final$From, pattern = "cas-(miR\\d*).*", replacement = "\\1")
+CT_edges_final<-unique(CT_edges_final)
+
+#still need to refine just CT_miRNA_nodes in order to subset the graph 
+CT_miRNA_Nodes_refined<-CT_miRNA_Nodes
+CT_miRNA_Nodes_refined$Node_ID<-sub(x=CT_miRNA_Nodes_refined$Node_ID, pattern = "cas-(miR\\d*).*", replacement = "\\1")
+CT_miRNA_Nodes_refined<-unique(CT_miRNA_Nodes_refined)
+CT_nodes_refined<-unique(bind_rows(CT_circ_nodes,refined_miRNA_nodes,CDS_Nodes))
+
+CT_net1_refined<-graph_from_data_frame(d=CT_edges_final, directed=F,vertices=CT_nodes_refined)
+
+CT_net1_refined_TG<-as_tbl_graph(CT_net1_refined)
+
+CT_numGenes_subg2_refined<-CT_net1_refined_TG %>% 
+  activate(nodes) %>% 
+  mutate(
+    gene_targets = centrality_degree(
+      weights = as.numeric(.E()$Target == 'Gene'),
+      mode = 'in')) %>% 
+  filter(.N()$name %in% c(CT_circ_nodes$Node_ID,CT_miRNA_Nodes_refined$Node_ID))
+#for publication
+  #fix legend
+  #add labels to miRNAs and create and add names to circRNAs 
+Pub_Graph1<-CT_numGenes_subg2_refined %>% 
+  ggraph(layout = 'fr')+
+  geom_edge_fan(width = .6, color = 'black',alpha=.3) + 
+  geom_node_point(aes(filter=Node_Type=="circRNA", shape=Node_Type, color=Node_Type),size=4)+
+  geom_node_label(aes(filter=Node_Type=="circRNA", label = Nicknames,fontface="italic"),nudge_y=-0.2,size=2)+
+  geom_node_point(aes(filter=Node_Type=="miRNA", shape =Node_Type, color=Node_Type),size=5)+
+  geom_node_text(aes(filter=Node_Type=="miRNA", label = gene_targets),nudge_y=-0.3) +
+  geom_node_text(aes(filter=Node_Type=="miRNA", label = .N()$name, fontface="bold"),nudge_y=0.3,size=3) +
+  coord_fixed() + 
+  theme_graph() 
+Pub_Graph1
+
+library(cowplot)
+
+ggsave(
+  filename="CT_network_figure.png",
+  plot = Pub_Graph1+scale_x_continuous(expand = expansion(mult = 0.1))+guides(colour=guide_legend("Node Type"), shape=guide_legend("Node Type"))
+,
+  device = NULL,
+  path = NULL,
+  scale = 1,
+  width = 170, #85 for half page width 170 for full page width
+  height = 170, #Max height is 225
+  units = "mm",
+  dpi = 300,
+  limitsize = TRUE,
+  bg = NULL,
+)
+
+```
+
+
+```{r make a similar figure but with the full set of circRNAs and miRNAs}
+Full_circ_nodes<- miRNA_merged_geneInfo %>% 
+  select(CircRNA_Cluster_ID) %>% 
+  dplyr::mutate(Node_type<-"circRNA") %>% 
+  unique()
+Full_miRNA_Nodes<- miRNA_merged_geneInfo %>% 
+  select(miRNA_Acc.) %>% 
+  dplyr::mutate(Node_type<-"miRNA") %>% 
+  unique()
+
+Full_edges<-miRNA_merged_geneInfo %>% 
+  select(miRNA_Acc., CircRNA_Cluster_ID)
+
+colnames(Full_circ_nodes)<-c("Node_ID","Node_Type")
+colnames(Full_miRNA_Nodes)<-c("Node_ID","Node_Type")
+
+Full_nodes<-unique(bind_rows(Full_circ_nodes,Full_miRNA_Nodes,CDS_miRNA_Nodes,CDS_Nodes))
+
+colnames(Full_edges)<-c("From","To")
+Full_edges$Target<-"circRNA"
+
+Full_edges_final<-unique(bind_rows(Full_edges,CDS_Edges))
+
+#put the network together
+Full_Net_1<-graph_from_data_frame(Full_edges_final,directed = F, vertices = Full_nodes)
+Full_Net_1_tg<-as_tbl_graph(Full_Net_1)
+```
+
+```{r create subgraph from full data showing all connected circs and miRNAs and all associated gene edges}
+
+Full_numGenes_subg<-Full_Net_1_tg %>% 
+  activate(nodes) %>% 
+  mutate(
+    gene_targets = centrality_degree(
+      weights = as.numeric(.E()$Target == 'Gene'),
+      mode = 'in')) %>% 
+  filter(.N()$name %in% c(Full_circ_nodes$Node_ID, Full_miRNA_Nodes$Node_ID))
+
+
+
+Ggraph6<-Full_numGenes_subg %>% 
+  as.igraph() %>% 
+  ggraph(layout = 'fr')+
+  geom_point_interactive(size = 3,
+    mapping = aes(x = x, y = y, data_id=Node_Type,
+                  tooltip = paste0(name)),alpha=0)+
+  geom_edge_arc(width = .6, color = 'black',alpha=.3) + 
+  geom_node_point(aes(filter=Node_Type=="circRNA", shape=Node_Type, color=Node_Type,size=5))+
+  geom_node_point(aes(filter=Node_Type=="miRNA", shape =Node_Type, color=Node_Type,size=5))+
+  geom_node_text(aes(filter=Node_Type=="miRNA", label = gene_targets),nudge_y=-0.3) +
+  coord_fixed() + 
+  theme_graph()
+girafe(ggobj = Ggraph6, width_svg = 8, height_svg = 8,
+       options = list(opts_sizing(rescale = FALSE), opts_zoom(min = 1, max =3)))
+```
